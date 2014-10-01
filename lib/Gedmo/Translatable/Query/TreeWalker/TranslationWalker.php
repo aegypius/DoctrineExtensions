@@ -11,6 +11,7 @@ use Doctrine\ORM\Query\AST\SelectStatement;
 use Doctrine\ORM\Query\Exec\SingleSelectExecutor;
 use Doctrine\ORM\Query\AST\RangeVariableDeclaration;
 use Doctrine\ORM\Query\AST\Join;
+use Doctrine\ORM\Query\AST\PartialObjectExpression;
 
 /**
  * The translation sql output walker makes it possible
@@ -104,7 +105,7 @@ class TranslationWalker extends SqlWalker
         if (!$AST instanceof SelectStatement) {
             throw new \Gedmo\Exception\UnexpectedValueException('Translation walker should be used only on select statement');
         }
-        $this->prepareTranslatedComponents();
+        $this->prepareTranslatedComponents($AST);
         return new SingleSelectExecutor($AST, $this);
     }
 
@@ -266,7 +267,7 @@ class TranslationWalker extends SqlWalker
      * @todo: make it cleaner
      * @return string
      */
-    private function prepareTranslatedComponents()
+    private function prepareTranslatedComponents($AST)
     {
         $q = $this->getQuery();
         $locale = $q->getHint(TranslatableListener::HINT_TRANSLATABLE_LOCALE);
@@ -284,6 +285,18 @@ class TranslationWalker extends SqlWalker
         $ea->setEntityManager($em);
         $joinStrategy = $q->getHint(TranslatableListener::HINT_INNER_JOIN) ? 'INNER' : 'LEFT';
 
+        $neededTranslations = [];
+        foreach ($AST->selectClause->selectExpressions as $expression) {
+            if ($expression->expression instanceof PartialObjectExpression) {
+                foreach ($expression->expression->partialFieldSet as $field) {
+                    $compTblAlias = $this->walkIdentificationVariable($expression->expression->identificationVariable, $field);
+                    $neededTranslations[$compTblAlias][]=$field;
+                }
+            } else {
+                $neededTranslations[$expression->expression] = true;
+            }
+        }
+
         foreach ($this->translatedComponents as $dqlAlias => $comp) {
             $meta = $comp['metadata'];
             $config = $this->listener->getConfiguration($em, $meta->name);
@@ -292,6 +305,14 @@ class TranslationWalker extends SqlWalker
             $transTable = $transMeta->getQuotedTableName($this->platform);
             foreach ($config['fields'] as $field) {
                 $compTblAlias = $this->walkIdentificationVariable($dqlAlias, $field);
+
+                if (!(
+                    (isset($neededTranslations[$dqlAlias]) && true === $neededTranslations[$dqlAlias]) ||
+                    (isset($neededTranslations[$compTblAlias]) && in_array($field, $neededTranslations[$compTblAlias]))
+                )) {
+                    continue;
+                }
+
                 $tblAlias = $this->getSQLTableAlias('trans'.$compTblAlias.$field);
                 $sql = " {$joinStrategy} JOIN ".$transTable.' '.$tblAlias;
                 $sql .= ' ON '.$tblAlias.'.'.$transMeta->getQuotedColumnName('locale', $this->platform)
@@ -316,9 +337,9 @@ class TranslationWalker extends SqlWalker
 
                 // Treat translation as original field type
                 $fieldMapping = $meta->getFieldMapping($field);
-                if ((($this->platform instanceof \Doctrine\DBAL\Platforms\MySqlPlatform) && 
+                if ((($this->platform instanceof \Doctrine\DBAL\Platforms\MySqlPlatform) &&
                     in_array($fieldMapping["type"], array("decimal"))) ||
-                    (!($this->platform instanceof \Doctrine\DBAL\Platforms\MySqlPlatform) && 
+                    (!($this->platform instanceof \Doctrine\DBAL\Platforms\MySqlPlatform) &&
                     !in_array($fieldMapping["type"], array("datetime", "datetimetz", "date", "time")))) {
                     $type = Type::getType($fieldMapping["type"]);
                     $substituteField = 'CAST(' . $substituteField . ' AS ' . $type->getSQLDeclaration($fieldMapping, $this->platform) . ')';
